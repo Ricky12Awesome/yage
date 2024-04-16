@@ -1,17 +1,33 @@
+#![feature(effects)]
+
 use wgpu::SurfaceTargetUnsafe;
+use winit::event_loop::EventLoopWindowTarget;
 use winit::keyboard::{Key, NamedKey};
-use winit::window::Window;
+use winit::window::{Window, WindowId};
 use winit::{event::*, event_loop::EventLoop, window::WindowBuilder};
+
+// chanced to use Cow::Borrowed instead of .into to be used in const
+macro_rules! include_wgsl {
+    ($($token:tt)*) => {
+        {
+            //log::info!("including '{}'", $($token)*);
+            wgpu::ShaderModuleDescriptor {
+                label: Some($($token)*),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!($($token)*))),
+            }
+        }
+    };
+}
+
+const SHADER: wgpu::ShaderModuleDescriptor = include_wgsl!("shader/shader.wgsl");
 
 struct State<'a> {
     surface: wgpu::Surface<'a>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    render_pipeline: wgpu::RenderPipeline,
     size: winit::dpi::PhysicalSize<u32>,
-    // The window must be declared after the surface, so
-    // it gets dropped after it as the surface contains
-    // unsafe references to the window's resources.
     window: Window,
 }
 
@@ -67,6 +83,53 @@ impl<'a> State<'a> {
             view_formats: vec![],
         };
 
+        let shader = device.create_shader_module(SHADER);
+        let render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Render Pipeline Layout"),
+                bind_group_layouts: &[],
+                push_constant_ranges: &[],
+            });
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Render Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main", // 1.
+                buffers: &[],           // 2.
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList, // 1.
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw, // 2.
+                cull_mode: Some(wgpu::Face::Back),
+                // Setting this to anything other than Fill requires Features::NON_FILL_POLYGON_MODE
+                polygon_mode: wgpu::PolygonMode::Fill,
+                // Requires Features::DEPTH_CLIP_CONTROL
+                unclipped_depth: false,
+                // Requires Features::CONSERVATIVE_RASTERIZATION
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,                         // 2.
+                mask: !0,                         // 3.
+                alpha_to_coverage_enabled: false, // 4.
+            },
+            fragment: Some(wgpu::FragmentState {
+                // 3.
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    // 4.
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview: None,
+        });
+
         surface.configure(&device, &config);
 
         Ok(Self {
@@ -76,6 +139,7 @@ impl<'a> State<'a> {
             config,
             size,
             window,
+            render_pipeline,
         })
     }
 
@@ -84,7 +148,11 @@ impl<'a> State<'a> {
     }
 
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
-        if new_size.width > 0 && new_size.height > 0 {
+        if new_size.width > 0
+            && new_size.height > 0
+            && new_size.width < 8192
+            && new_size.height < 8192
+        {
             self.size = new_size;
             self.config.width = new_size.width;
             self.config.height = new_size.height;
@@ -100,13 +168,18 @@ impl<'a> State<'a> {
 
     fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Render Encoder"),
-        });
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Render Encoder"),
+            });
 
         {
-            let _render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
@@ -125,18 +198,60 @@ impl<'a> State<'a> {
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
+
+            render_pass.set_pipeline(&self.render_pipeline); // 2.
+            render_pass.draw(0..3, 0..1); // 3.
         }
 
         // submit will accept anything that implements IntoIter
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
-        
+
         Ok(())
+    }
+}
+
+const ESC_KEY: Key = Key::Named(NamedKey::Escape);
+
+#[allow(unused)]
+fn handle_window_events(
+    state: &mut State,
+    window_id: WindowId,
+    event: &WindowEvent,
+    win: &EventLoopWindowTarget<()>,
+) {
+    match event {
+        WindowEvent::RedrawRequested => {
+            state.update();
+
+            match state.render() {
+                Ok(_) => {}
+                // Reconfigure the surface if lost
+                Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
+                // The system is out of memory, we should probably quit
+                Err(wgpu::SurfaceError::OutOfMemory) => win.exit(),
+                // All other errors (Outdated, Timeout) should be resolved by the next frame
+                Err(e) => eprintln!("{:?}", e),
+            }
+        }
+        WindowEvent::CloseRequested
+        | WindowEvent::KeyboardInput {
+            event: KeyEvent {
+                logical_key: ESC_KEY,
+                ..
+            },
+            ..
+        } => win.exit(),
+        WindowEvent::Resized(physical_size) => {
+            state.resize(*physical_size);
+        }
+        _ => {}
     }
 }
 
 pub async fn run() -> anyhow::Result<()> {
     env_logger::init();
+
     let event_loop = EventLoop::new()?;
     let window = WindowBuilder::new().build(&event_loop)?;
     let mut state = State::new(window).await?;
@@ -149,35 +264,8 @@ pub async fn run() -> anyhow::Result<()> {
             if state.input(event) {
                 return;
             }
-            
-            match event {
-                WindowEvent::RedrawRequested if window_id == state.window().id() => {
-                    state.update();
-                    
-                    match state.render() {
-                        Ok(_) => {}
-                        // Reconfigure the surface if lost
-                        Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
-                        // The system is out of memory, we should probably quit
-                        Err(wgpu::SurfaceError::OutOfMemory) => win.exit(),
-                        // All other errors (Outdated, Timeout) should be resolved by the next frame
-                        Err(e) => eprintln!("{:?}", e),
-                    }
-                },
-                WindowEvent::CloseRequested
-                | WindowEvent::KeyboardInput {
-                    event:
-                        KeyEvent {
-                            logical_key: Key::Named(NamedKey::Escape),
-                            ..
-                        },
-                    ..
-                } => win.exit(),
-                WindowEvent::Resized(physical_size) => {
-                    state.resize(*physical_size);
-                }
-                _ => {}
-            }
+
+            handle_window_events(&mut state, window_id, event, win)
         }
         _ => {}
     })?;
