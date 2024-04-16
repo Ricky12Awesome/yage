@@ -1,3 +1,5 @@
+use yet_another_game_engine::*;
+
 fn main() {
-    println!("Hello, world!");
+    pollster::block_on(run()).unwrap();
 }
