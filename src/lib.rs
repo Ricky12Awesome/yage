@@ -1,12 +1,12 @@
 #![feature(effects)]
 
-use wgpu::SurfaceTargetUnsafe;
+use wgpu::{PresentMode, SurfaceTargetUnsafe};
 use winit::event_loop::EventLoopWindowTarget;
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 use winit::{event::*, event_loop::EventLoop, window::WindowBuilder};
 
-// chanced to use Cow::Borrowed instead of .into to be used in const
+/// changed to use Cow::Borrowed instead of .into to be used in const
 macro_rules! include_wgsl {
     ($($token:tt)*) => {
         {
@@ -72,12 +72,19 @@ impl<'a> State<'a> {
             .find(|f| f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
 
+        let surface_present_mode = surface_caps
+          .present_modes
+          .iter()
+          .copied()
+          .find(|&f| f == PresentMode::Immediate)
+          .unwrap_or(surface_caps.present_modes[0]);
+
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width: size.width,
             height: size.height,
-            present_mode: surface_caps.present_modes[0],
+            present_mode: surface_present_mode,
             desired_maximum_frame_latency: 1,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
@@ -186,9 +193,9 @@ impl<'a> State<'a> {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.2,
-                            b: 0.3,
+                            r: 8. / 255.,
+                            g: 8. / 255.,
+                            b: 8. / 255.,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -253,21 +260,27 @@ pub async fn run() -> anyhow::Result<()> {
     env_logger::init();
 
     let event_loop = EventLoop::new()?;
-    let window = WindowBuilder::new().build(&event_loop)?;
+    let window = WindowBuilder::new()
+      .with_min_inner_size(winit::dpi::PhysicalSize::new(64, 64))
+      .build(&event_loop)?;
     let mut state = State::new(window).await?;
 
-    event_loop.run(move |event, win| match event {
-        Event::WindowEvent {
-            ref event,
-            window_id,
-        } if window_id == state.window().id() => {
-            if state.input(event) {
-                return;
-            }
+    event_loop.run(move |event, win| {
+        match event {
+            Event::WindowEvent {
+                ref event,
+                window_id,
+            } if window_id == state.window().id() => {
+                if state.input(event) {
+                    return;
+                }
 
-            handle_window_events(&mut state, window_id, event, win)
+                handle_window_events(&mut state, window_id, event, win);
+            }
+            _ => {}
         }
-        _ => {}
+
+        state.window().request_redraw();
     })?;
 
     Ok(())
